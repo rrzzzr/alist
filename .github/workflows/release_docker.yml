@@ -51,13 +51,13 @@ jobs:
             version=${{ github.ref_name }}
             webVersion=$(curl -s -t1 -T2 "https://api.github.com/repos/alist-org/alist-web/releases/latest" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
             echo "Fetching release web assets..."
-            curl -L https://github.com/alist-org/alist-web/releases/latest/download/dist.tar.gz -o dist.tar.gz
+            curl -L https://github.com/AlistGo/alist-web/releases/download/3.38.0/dist.tar.gz -o dist.tar.gz
           else
             SHORT_SHA=$(git rev-parse --short=7 ${{ github.sha }})
             version="main-${SHORT_SHA}"
             webVersion="dev"
             echo "Fetching dev web assets..."
-            curl -L https://codeload.github.com/alist-org/web-dist/tar.gz/refs/heads/dev -o dist.tar.gz
+            curl -L https://github.com/AlistGo/alist-web/releases/download/3.38.0/dist.tar.gz -o dist.tar.gz
           fi
           tar -zxvf dist.tar.gz
           rm -rf public/dist
