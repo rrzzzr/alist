@@ -4,38 +4,171 @@ on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}/alist
+  ARTIFACT_NAME: 'binaries_docker_release'
+  RELEASE_PLATFORMS: 'linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/arm/v6,linux/s390x,linux/ppc64le,linux/riscv64'
+  IMAGE_PUSH: ${{ github.event_name == 'push' }}
+  IMAGE_IS_PROD: ${{ github.ref_type == 'tag' }}
+  IMAGE_TAGS_BETA: |
+    type=schedule
+    type=ref,event=branch
+    type=ref,event=tag
+    type=ref,event=pr
+    type=raw,value=beta,enable={{is_default_branch}}
 jobs:
-  release_docker:
-    name: Release Docker
+  build_binary:
+    name: Build Binaries for Docker Release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: 'stable'
 
+      - name: Determine Version and Build Flags
+        id: build_vars
+        run: |
+          builtAt=$(date +'%F %T %z')
+          gitAuthor="Xhofe <i@nn.ci>"
+          gitCommit=$(git log --pretty=format:"%h" -1)
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            version=${{ github.ref_name }}
+            webVersion=$(curl -s -t1 -T2 "https://api.github.com/repos/alist-org/alist-web/releases/latest" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+            echo "Fetching release web assets..."
+            curl -L https://github.com/alist-org/alist-web/releases/latest/download/dist.tar.gz -o dist.tar.gz
+          else
+            SHORT_SHA=$(git rev-parse --short=7 ${{ github.sha }})
+            version="main-${SHORT_SHA}"
+            webVersion="dev"
+            echo "Fetching dev web assets..."
+            curl -L https://codeload.github.com/alist-org/web-dist/tar.gz/refs/heads/dev -o dist.tar.gz
+          fi
+          tar -zxvf dist.tar.gz
+          rm -rf public/dist
+          mv -f dist public || mv -f web-dist-dev/dist public
+          rm -f dist.tar.gz
+          ldflags="\
+          -w -s \
+          -X 'github.com/alist-org/alist/v3/internal/conf.BuiltAt=${builtAt}' \
+          -X 'github.com/alist-org/alist/v3/internal/conf.GitAuthor=${gitAuthor}' \
+          -X 'github.com/alist-org/alist/v3/internal/conf.GitCommit=${gitCommit}' \
+          -X 'github.com/alist-org/alist/v3/internal/conf.Version=${version}' \
+          -X 'github.com/alist-org/alist/v3/internal/conf.WebVersion=${webVersion}'"
+          echo "VERSION=${version}" >> $GITHUB_ENV
+          echo "LDFLAGS=${ldflags}" >> $GITHUB_ENV
+          echo "Backend Version: ${version}"
+          echo "Frontend Version: ${webVersion}"
       - name: Cache Musl
         id: cache-musl
         uses: actions/cache@v4
         with:
           path: build/musl-libs
-          key: docker-musl-libs
+          key: docker-musl-libs-v2-${{ runner.os }}
 
-      - name: Download Musl Library
+      - name: Prepare Musl toolchain
         if: steps.cache-musl.outputs.cache-hit != 'true'
-        run: bash build.sh prepare docker-multiplatform
-
-      - name: Build go binary
-        run: bash build.sh release docker-multiplatform
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
+        run: |
+          mkdir -p build/musl-libs
+          BASE="https://spring-night-7883.nipby1-cofqyq-hohwoc.workers.dev/https://musl.cc/"
+          FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross i486-linux-musl-cross s390x-linux-musl-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross riscv64-linux-musl-cross powerpc64le-linux-musl-cross)
+          for i in "${FILES[@]}"; do
+            url="${BASE}${i}.tgz"
+            echo "Downloading ${url}"
+            lib_tgz="build/${i}.tgz"
+            curl -L -o "${lib_tgz}" "${url}"
+            tar xf "${lib_tgz}" --strip-components 1 -C build/musl-libs
+            rm -f "${lib_tgz}"
+          done
+      - name: Build binaries for Docker multiplatform
+        run: |
+          go mod download
+          export PATH=$PATH:$PWD/build/musl-libs/bin
+          docker_lflags="--extldflags '-static -fpic' ${{ env.LDFLAGS }}"
+          export CGO_ENABLED=1
+          OS_ARCHES=(linux-amd64 linux-arm64 linux-386 linux-s390x linux-riscv64 linux-ppc64le)
+          CGO_ARGS=(x86_64-linux-musl-gcc aarch64-linux-musl-gcc i486-linux-musl-gcc s390x-linux-musl-gcc riscv64-linux-musl-gcc powerpc64le-linux-musl-gcc)
+          for i in "${!OS_ARCHES[@]}"; do
+            os_arch=${OS_ARCHES[$i]}
+            cgo_cc=${CGO_ARGS[$i]}
+            os=${os_arch%%-*}
+            arch=${os_arch##*-}
+            export GOOS=$os
+            export GOARCH=$arch
+            export CC=${cgo_cc}
+            echo "building for $os_arch"
+            go build -o build/$os/$arch/alist -ldflags="$docker_lflags" -tags=jsoniter .
+          done
+          DOCKER_ARM_ARCHES=(linux-arm/v6 linux-arm/v7)
+          CGO_ARGS=(armv6-linux-musleabihf-gcc armv7l-linux-musleabihf-gcc)
+          GO_ARM=(6 7)
+          export GOOS=linux
+          export GOARCH=arm
+          for i in "${!DOCKER_ARM_ARCHES[@]}"; do
+            docker_arch=${DOCKER_ARM_ARCHES[$i]}
+            cgo_cc=${CGO_ARGS[$i]}
+            export GOARM=${GO_ARM[$i]}
+            export CC=${cgo_cc}
+            echo "building for $docker_arch"
+            go build -o build/${docker_arch%%-*}/${docker_arch##*-}/alist -ldflags="$docker_lflags" -tags=jsoniter .
+          done
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          images: xhofe/alist
+          name: ${{ env.ARTIFACT_NAME }}
+          overwrite: true
+          path: |
+            build/
+            !build/*.tgz
+            !build/musl-libs/**
+  release_docker:
+    needs: build_binary
+    name: Release Docker image
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ["latest", "ffmpeg", "aria2", "aio"]
+        include:
+          - image: "latest"
+            build_arg: ""
+            tag_favor: ""
+          - image: "ffmpeg"
+            build_arg: INSTALL_FFMPEG=true
+            tag_favor: "suffix=-ffmpeg,onlatest=true"
+          - image: "aria2"
+            build_arg: INSTALL_ARIA2=true
+            tag_favor: "suffix=-aria2,onlatest=true"
+          - image: "aio"
+            build_arg: |
+              INSTALL_FFMPEG=true
+              INSTALL_ARIA2=true
+            tag_favor: "suffix=-aio,onlatest=true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: 'build/'
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -43,66 +176,31 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to DockerHub
+      - name: Login to GitHub Container Registry
+        if: env.IMAGE_PUSH == 'true'
         uses: docker/login-action@v3
         with:
-          username: xhofe
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}
+          tags: ${{ env.IMAGE_IS_PROD == 'true' && '' || env.IMAGE_TAGS_BETA }}
+          flavor: |
+            ${{ env.IMAGE_IS_PROD == 'true' && 'latest=true' || '' }}
+            ${{ matrix.tag_favor }}
       - name: Build and push
         id: docker_build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.ci
-          push: true
+          push: ${{ env.IMAGE_PUSH == 'true' }}
+          build-args: ${{ matrix.build_arg }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/arm/v6,linux/s390x
-
-      - name: Docker meta with ffmpeg
-        id: meta-ffmpeg
-        uses: docker/metadata-action@v5
-        with:
-          images: xhofe/alist
-          flavor: |
-            latest=true
-            suffix=-ffmpeg,onlatest=true
-            
-      - name: Build and push with ffmpeg
-        id: docker_build_ffmpeg
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.ci
-          push: true
-          tags: ${{ steps.meta-ffmpeg.outputs.tags }}
-          labels: ${{ steps.meta-ffmpeg.outputs.labels }}
-          build-args: INSTALL_FFMPEG=true
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/arm/v6,linux/s390x
-
-  release_docker_with_aria2:
-    needs: release_docker
-    name: Release docker with aria2
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          repository: alist-org/with_aria2
-          ref: main
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Add tag
-        run: |
-          git config --local user.email "bot@nn.ci"
-          git config --local user.name "IlaBot"
-          git tag -a ${{ github.ref_name }} -m "release ${{ github.ref_name }}"
-
-      - name: Push tags
-        uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.MY_TOKEN }}
-          branch: main
-          repository: alist-org/with_aria2
+          platforms: ${{ env.RELEASE_PLATFORMS }}

@@ -21,6 +21,7 @@ RUN apk update && \
     rm -rf /var/cache/apk/*
 
 COPY --from=builder /app/bin/alist ./
+RUN chmod +x ./alist
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && /entrypoint.sh version
 
